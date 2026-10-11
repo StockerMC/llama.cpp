@@ -35,15 +35,19 @@
 #include "testing.h"
 
 #include <algorithm>
+#include <atomic>
 #include <clocale>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <random>
 #include <regex>
 #include <string>
+#include <thread>
 #include <vector>
 
 // tokenize the prompt, or generate random tokens for models without a tokenizer
@@ -89,16 +93,94 @@ static std::vector<std::string> collect_models(const std::string & models_dir) {
     return models;
 }
 
+// one row of the result table
+struct model_result {
+    std::string name;
+    std::string log_path;
+    std::vector<case_run> runs;
+    bool failed = false;
+};
+
+// run the selected cases for one model and report the verdicts
+//
+// safe to call from a worker thread: the log capture, the harness and the state file are all
+// either per thread or named after the model
+//
+// capture_log keeps the log of the run in a file - table mode always does, so that a failing
+// model can be dumped after the table; single model mode only does when --logs asks for it and
+// writes straight to stderr otherwise
+static model_result run_model(const std::string & model_path,
+                              const common_params & params,
+                              const std::vector<const ctx_test *> & cases,
+                              const std::string & logs_dir,
+                              testing & t,
+                              bool capture_log) {
+    model_result res;
+
+    res.name     = std::filesystem::path(model_path).filename().string();
+    res.log_path = test_log_path(logs_dir, res.name);
+
+    if (capture_log) {
+        // capture the model from the moment it is loaded, so that even a load failure has a log
+        test_log_capture_start(params.verbosity);
+        test_log().open(res.log_path);
+    }
+
+    struct common_params model_params = params;
+    model_params.model.path = model_path;
+
+    // a model that cannot be loaded is a failure, not a skip - and it never reaches the harness,
+    //   so the verdicts are recorded here
+    auto llama_init = common_init_from_params(model_params, true);
+    if (llama_init->model() == nullptr) {
+        TLOG_ERR("%s: failed to init model '%s'\n", __func__, model_path.c_str());
+
+        for (const auto * tc : cases) {
+            case_run run;
+            run.test   = tc;
+            run.name   = tc->name();
+            run.status = test_status::FAIL;
+            run.reason = "the model failed to load";
+            res.runs.push_back(std::move(run));
+        }
+    } else {
+        GGML_ASSERT(llama_init->context() == nullptr);
+
+        model_run mr;
+        mr.model  = llama_init->model();
+        mr.name   = res.name;
+        // the cases share a working directory, so state files are named after the model
+        mr.params          = std::move(model_params);
+        mr.params.out_file = test_state_path(res.name);
+        mr.tokens          = prepare_tokens(mr.model, mr.params);
+
+        res.runs = run_cases(mr, t, cases);
+    }
+
+    if (capture_log) {
+        test_log().close();
+    }
+
+    std::remove(test_state_path(res.name).c_str()); // the cases leave the session file behind
+
+    res.failed = std::any_of(res.runs.begin(), res.runs.end(),
+            [](const case_run & run) { return run.status == test_status::FAIL; });
+
+    return res;
+}
+
 static void print_usage(int /* argc */, char ** argv) {
     LOG("\nexample usage:\n");
     LOG("\n  %s -m your_model.gguf\n", argv[0]);
     LOG("\n  %s --models tests/test-models\n", argv[0]);
     LOG("\n  %s --models tests/test-models --test 'rollback|replay'\n", argv[0]);
+    LOG("\n  %s --models tests/test-models -j 8\n", argv[0]);
     LOG("\n  %s -m your_model.gguf -lv 5\n", argv[0]);
     LOG("\nspecial flags:\n");
     LOG("\n  --models DIR              run every .gguf in DIR and print a result table\n");
     LOG("\n  --test REGEX              run only the cases whose name matches REGEX\n");
     LOG("\n  --list                    list the registered cases and exit\n");
+    LOG("\n  -j N, --threads N         run N models at a time in --models mode (default: min(nproc, 4))\n");
     LOG("\n  --logs DIR                keep the log of each model in DIR instead of discarding it\n");
     LOG("\n  --logs-on-fail always     after the table, print the log of every failed model (default)\n");
     LOG("\n  --logs-on-fail never      never print the logs of the failed models\n");
@@ -132,6 +214,22 @@ int main(int argc, char ** argv) {
     std::string test_filter;
     bool          list_cases      = false;
     bool          dump_logs_on_fail = true;
+    int           parallel_workers  = 0; // 0 = auto, same flag as in test-backend-ops
+
+    auto parse_parallel_workers = [&](const char * flag, const char * value) {
+        try {
+            parallel_workers = std::stoi(value);
+        } catch (const std::exception &) {
+            fprintf(stderr, "%s: expected a number, got '%s'\n", flag, value);
+            return false;
+        }
+        if (parallel_workers < 1) {
+            fprintf(stderr, "%s: expected a positive number, got %d\n", flag, parallel_workers);
+            return false;
+        }
+
+        return true;
+    };
 
     std::vector<char *> filtered_argv;
     filtered_argv.push_back(argv[0]);
@@ -180,6 +278,30 @@ int main(int argc, char ** argv) {
             continue;
         }
 
+        // -j is the flag of test-backend-ops, --threads is its long form
+        if (std::strcmp(argv[i], "-j") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "-j requires a number argument\n");
+                return 1;
+            }
+            if (!parse_parallel_workers("-j", argv[i])) {
+                return 1;
+            }
+            continue;
+        }
+
+        const int res_threads = test_opt(argv, i, argc, "--threads", value);
+        if (res_threads != 0) {
+            if (res_threads < 0) {
+                fprintf(stderr, "--threads requires a number argument\n");
+                return 1;
+            }
+            if (!parse_parallel_workers("--threads", value.c_str())) {
+                return 1;
+            }
+            continue;
+        }
+
         if (std::strcmp(argv[i], "--list") == 0) {
             list_cases = true;
             continue;
@@ -208,6 +330,11 @@ int main(int argc, char ** argv) {
     // -lv applies to the test's own logging too
     test_log().set_threshold(params.verbosity);
 
+    // one model per thread: fitting the params to the free memory would swap in a log callback
+    //   that points to the stack of the thread doing the fit, which is only safe while no other
+    //   thread is inside llama - and the models of this test are far too small to need it
+    params.fit_params = false;
+
     const std::vector<const ctx_test *> cases = select_cases(test_filter);
     if (cases.empty()) {
         fprintf(stderr, "--test '%s' selected no cases, see --list\n", test_filter.c_str());
@@ -231,48 +358,21 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
 
-    // the harness reports the cases through the test logger, so that its verdicts end up in the
-    // per-model capture in --models mode and on stderr otherwise
-    testing t(test_log_stream());
-
     // run the full suite for a single model
     if (models_dir.empty()) {
-        model_run mr;
-        mr.params          = params;
-        mr.name            = std::filesystem::path(params.model.path).filename().string();
-        mr.params.out_file = test_state_path(mr.name);
+        // the harness reports the cases through the test logger, so that its verdicts end up in
+        //   the per-model capture with --logs and on stderr otherwise
+        testing t(test_log_stream());
 
-        if (!logs_dir.empty()) {
-            test_log().open(test_log_path(logs_dir, mr.name));
-        }
+        const model_result res = run_model(params.model.path, params, cases, logs_dir, t, !logs_dir.empty());
 
-        auto llama_init = common_init_from_params(params, true);
-
-        GGML_ASSERT(llama_init->context() == nullptr);
-        if (llama_init->model() == nullptr) {
-            TLOG_ERR("%s: failed to init model '%s'\n", __func__, params.model.path.c_str());
-            test_log().close();
-            return 1;
-        }
-
-        mr.model  = llama_init->model();
-        mr.tokens = prepare_tokens(mr.model, mr.params);
-
-        const auto runs = run_cases(mr, t, cases);
-        test_log().close();
-
-        std::remove(mr.params.out_file.c_str()); // the cases leave the session file behind
-
-        bool failed = false;
-        for (const auto & run : runs) {
-            failed = failed || run.status == test_status::FAIL;
-        }
-
-        if (!failed) {
+        if (!res.failed) {
             LOG("All applicable tests passed.\n");
         }
 
-        return t.summary();
+        // a model that failed to load never reached the harness, its verdicts are only in the
+        //   result - the exit code has to come from there
+        return res.failed ? 1 : t.summary();
     }
 
     // table mode: run the suite for every model in the directory
@@ -315,82 +415,102 @@ int main(int argc, char ** argv) {
 
     size_t n_model_fail = 0;
 
-    for (const auto & model_path : models) {
-        const auto name = std::filesystem::path(model_path).filename().string();
+    // the models are independent of each other, so they run on several threads - but the table
+    //   is printed in model order, with the log of a failed model right after its row, exactly as
+    //   if the models had run one by one: a worker stores its result and then prints every row
+    //   that became printable in order, under the print lock
+    std::vector<model_result> results(models.size());
+    std::vector<char>         ready(models.size(), 0);
 
-        LOG("%-*s", (int) name_width, name.c_str());
-        common_log_flush(common_log_main());
+    std::mutex pool_mutex;
+    size_t     next_print = 0;
 
-        std::vector<case_run> runs;
+    auto print_ready = [&]() {
+        std::lock_guard<std::mutex> lock(pool_mutex);
 
-        // capture this model from the moment it is loaded, so that even a load failure has a log
-        const std::string log_path = test_log_path(logs_dir, name);
-        test_log().open(log_path);
+        while (next_print < results.size() && ready[next_print]) {
+            const model_result & res = results[next_print];
 
-        {
-            struct common_params model_params = params;
-            model_params.model.path = model_path;
+            LOG("%-*s", (int) name_width, res.name.c_str());
 
-            // a model that cannot be loaded is a failure, not a skip
-            auto llama_init = common_init_from_params(model_params, true);
-            if (llama_init->model() == nullptr) {
-                TLOG_ERR("%s: failed to init model '%s'\n", __func__, model_path.c_str());
-                for (const auto & tc : cases) {
-                    case_run run;
-                    run.test   = tc;
-                    run.name   = tc->name();
-                    run.status = test_status::FAIL;
-                    run.reason = "the model failed to load";
-                    runs.push_back(std::move(run));
+            for (size_t i = 0; i < res.runs.size(); i++) {
+                LOG("  %s%*s", test_status_str(res.runs[i].status), col_width(cases[i]->name()) - 4, "");
+
+                switch (res.runs[i].status) {
+                    case test_status::PASS: n_pass[i]++; break;
+                    case test_status::FAIL: n_fail[i]++; break;
+                    case test_status::SKIP: n_skip[i]++; break;
                 }
-            } else {
-                GGML_ASSERT(llama_init->context() == nullptr);
-
-                model_run mr;
-                mr.params          = std::move(model_params);
-                mr.name            = name;
-                mr.model           = llama_init->model();
-                // the cases share a working directory, so state files are named after the model
-                mr.params.out_file = test_state_path(name);
-                mr.tokens          = prepare_tokens(mr.model, mr.params);
-
-                runs = run_cases(mr, t, cases);
             }
-        }
-
-        for (size_t i = 0; i < runs.size(); i++) {
-            LOG("  %s%*s", test_status_str(runs[i].status), col_width(cases[i]->name()) - 4, "");
-
-            switch (runs[i].status) {
-                case test_status::PASS: n_pass[i]++; break;
-                case test_status::FAIL: n_fail[i]++; break;
-                case test_status::SKIP: n_skip[i]++; break;
-            }
-        }
-        LOG("\n");
-        common_log_flush(common_log_main());
-
-        const bool failed = std::any_of(runs.begin(), runs.end(),
-                [](const case_run & run) { return run.status == test_status::FAIL; });
-        n_model_fail += failed;
-
-        test_log().close();
-        std::remove(test_state_path(name).c_str()); // the cases leave the session file behind
-
-        // dump the log of a failed model once the table is printed - interleaving it with the
-        //   rows would make the table unreadable; keep the file when the dump was truncated
-        if (failed && dump_logs_on_fail) {
-            LOG("\n=== logs: %s (%s) ===\n", name.c_str(), log_path.c_str());
+            LOG("\n");
             common_log_flush(common_log_main());
 
-            // keep the file when the dump was truncated, or when a log directory was requested
-            if (!test_log_dump(log_path, LOG_DUMP_MAX_BYTES) && logs_dir.empty()) {
-                std::remove(log_path.c_str());
+            // a log is discarded when it was printed in full and nobody asked to keep it
+            bool keep_log = !logs_dir.empty();
+
+            if (res.failed) {
+                n_model_fail++;
+
+                // dump the log of a failed model once its row is printed - interleaving it with
+                //   the rows would make the table unreadable
+                if (dump_logs_on_fail) {
+                    LOG("\n=== logs: %s (%s) ===\n", res.name.c_str(), res.log_path.c_str());
+                    common_log_flush(common_log_main());
+
+                    // a dump that had to be cut short leaves the file behind, the table cannot
+                    //   show the whole log
+                    keep_log = keep_log || !test_log_dump(res.log_path, LOG_DUMP_MAX_BYTES);
+                }
             }
-        } else if (logs_dir.empty()) {
-            std::remove(log_path.c_str());
+
+            if (!keep_log) {
+                std::remove(res.log_path.c_str());
+            }
+
+            ++next_print;
         }
+    };
+
+    std::atomic<size_t> next_model(0);
+
+    auto worker = [&]() {
+        // one harness per thread - its verdict lines go into the capture of the model being run
+        testing t(test_log_stream());
+
+        for (size_t i = next_model.fetch_add(1); i < results.size(); i = next_model.fetch_add(1)) {
+            results[i] = run_model(models[i], params, cases, logs_dir, t, true);
+
+            {
+                std::lock_guard<std::mutex> lock(pool_mutex);
+                ready[i] = 1;
+            }
+
+            print_ready();
+        }
+    };
+
+    // the dummy models are tiny, but the same flag is meant to run sweeps of real checkpoints,
+    //   where every worker holds the weights it loaded - so do not scale with the cores
+    const unsigned n_hw    = std::thread::hardware_concurrency();
+    const size_t   n_auto  = n_hw > 0 ? std::min<size_t>(n_hw, 4) : 1;
+    const size_t   n_pool  = parallel_workers > 0
+        ? std::min<size_t>((size_t) parallel_workers, results.size())
+        : n_auto;
+
+    std::vector<std::thread> pool;
+    pool.reserve(n_pool > 0 ? n_pool - 1 : 0);
+
+    for (size_t i = 1; i < n_pool; i++) {
+        pool.emplace_back(worker);
     }
+
+    worker(); // the main thread runs models like any other worker
+
+    for (auto & t : pool) {
+        t.join();
+    }
+
+    print_ready(); // the last worker can have stored its result while the others were joining
 
     common_log_set_verbosity_thold(LOG_DEFAULT_LLAMA);
     common_log_flush(common_log_main());

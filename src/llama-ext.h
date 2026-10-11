@@ -90,6 +90,12 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// Turn the KV cache attention rotation on or off for the contexts created from this model. It is
+// on by default, and applies only where the KV cache type allows it
+// Unlike the LLAMA_ATTN_ROT_DISABLE environment variable, this is safe to use while other threads
+// are inside llama
+LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

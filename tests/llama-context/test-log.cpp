@@ -5,9 +5,11 @@
 #include <algorithm>
 #include <csignal>
 #include <cstdio>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <iterator>
+#include <mutex>
 
 #if defined(_WIN32)
 #  define TEST_LOG_ABORT_DUMP 0
@@ -18,6 +20,38 @@
 #endif
 
 const size_t LOG_DUMP_MAX_BYTES = 64 * 1024;
+
+namespace {
+
+// the captures the workers have open right now - an abort dumps all of them, because the thread
+//   that aborts is not necessarily the one that runs the model that matters
+// the abort handler reads this while the other workers keep running, so it is a fixed array of
+//   borrowed C strings and no mutex - the strings are owned by the loggers that publish them
+constexpr size_t TEST_LOG_MAX_OPEN = 64;
+
+std::atomic<const char *> g_open_logs[TEST_LOG_MAX_OPEN];
+
+void test_log_open_add(const char * path) {
+    for (auto & slot : g_open_logs) {
+        const char * empty = nullptr;
+        if (slot.compare_exchange_strong(empty, path)) {
+            return;
+        }
+    }
+
+    // more captures than slots - the run continues, only the abort dump misses this one
+}
+
+void test_log_open_del(const char * path) {
+    for (auto & slot : g_open_logs) {
+        const char * mine = path;
+        slot.compare_exchange_strong(mine, nullptr);
+    }
+}
+
+std::once_flag g_install_once;
+
+} // namespace
 
 static const char * test_log_prefix(enum ggml_log_level level) {
     switch (level) {
@@ -39,7 +73,11 @@ void test_logger::open(const std::string & path_) {
     std::lock_guard<std::mutex> lock(mtx);
 
     capturing = true;
-    path      = path_;
+
+    if (!path.empty()) {
+        test_log_open_del(path.c_str()); // before the string moves
+    }
+    path = path_;
 
     file.close();
     file.open(path, std::ios::binary | std::ios::trunc);
@@ -48,12 +86,18 @@ void test_logger::open(const std::string & path_) {
         return;
     }
 
+    test_log_open_add(path.c_str()); // the logger owns the string, the pointer lives until close
+
     file << pending;
     pending.clear();
 }
 
 void test_logger::close() {
     std::lock_guard<std::mutex> lock(mtx);
+
+    if (!path.empty()) {
+        test_log_open_del(path.c_str());
+    }
 
     file.close();
     path.clear();
@@ -110,8 +154,9 @@ void test_logger::write(enum ggml_log_level level, const char * fmt, va_list arg
     fflush(stderr);
 }
 
-void test_logger::dump_tail(size_t max_bytes) {
+void test_logger::dump_tail(const std::string & path, size_t max_bytes) {
 #if !TEST_LOG_ABORT_DUMP
+    (void) path;
     (void) max_bytes;
 #else
     if (path.empty()) {
@@ -124,8 +169,8 @@ void test_logger::dump_tail(size_t max_bytes) {
         return;
     }
 
-    static const char banner[] = "\n=== aborted, tail of the captured log ===\n";
-    if (::write(STDERR_FILENO, banner, sizeof(banner) - 1) < 0) {
+    const std::string banner = "\n=== aborted, tail of the captured log: " + path + " ===\n";
+    if (::write(STDERR_FILENO, banner.c_str(), banner.size()) < 0) {
         // nothing else can be done
     }
 
@@ -153,7 +198,10 @@ void test_logger::dump_tail(size_t max_bytes) {
 }
 
 test_logger & test_log() {
-    static test_logger log;
+    // one capture per thread: table mode runs a model per worker and the llama, ggml and backend
+    //   callbacks fire on the thread that produced the message
+    thread_local test_logger log;
+
     return log;
 }
 
@@ -173,7 +221,15 @@ void test_log_callback(enum ggml_log_level level, const char * text, void * /* u
 }
 
 static void test_log_abort(int sig) {
-    test_log().dump_tail(LOG_DUMP_MAX_BYTES);
+    // the other workers keep running while the dumps are written, the registry is built to be
+    //   read without a lock
+    for (const auto & slot : g_open_logs) {
+        const char * path = slot.load();
+
+        if (path != nullptr) {
+            test_logger::dump_tail(path, LOG_DUMP_MAX_BYTES);
+        }
+    }
 
     signal(sig, SIG_DFL);
     raise(sig);
@@ -258,8 +314,10 @@ struct test_log_streambuf : std::streambuf {
 } // namespace
 
 std::ostream & test_log_stream() {
-    static test_log_streambuf sb;
-    static std::ostream       out(&sb);
+    // per thread, like the capture it funnels into - the streambuf accumulates a partial line,
+    //   two workers writing to one of them would interleave their verdicts
+    thread_local test_log_streambuf sb;
+    thread_local std::ostream       out(&sb);
 
     out.flush();
 
@@ -274,26 +332,23 @@ void test_log_capture_start(int verbosity) {
     // note: -lv raises this, use -lv 5 to capture the graph debug as well
     log.set_threshold(std::max(verbosity, LOG_LEVEL_INFO));
     log.capturing = true;
-    llama_log_set(test_log_callback, nullptr);
 
-    // a model that aborts would take the run, and with it the log of the very model that
-    //   aborted, down with it - print what was captured so far before going away
+    // the callback and the handlers are process wide, the captures are per thread
+    std::call_once(g_install_once, []() {
+        llama_log_set(test_log_callback, nullptr);
+
+        // a model that aborts would take the run, and with it the log of the very model that
+        //   aborted, down with it - print what was captured so far before going away
 #if TEST_LOG_ABORT_DUMP
-    signal(SIGABRT, test_log_abort);
-    signal(SIGSEGV, test_log_abort);
-    signal(SIGFPE,  test_log_abort);
-    signal(SIGILL,  test_log_abort);
+        signal(SIGABRT, test_log_abort);
+        signal(SIGSEGV, test_log_abort);
+        signal(SIGFPE,  test_log_abort);
+        signal(SIGILL,  test_log_abort);
 #  ifdef SIGBUS
-    signal(SIGBUS, test_log_abort);
+        signal(SIGBUS, test_log_abort);
 #  endif
 #endif // TEST_LOG_ABORT_DUMP
-}
-
-void test_log_capture_stop() {
-    test_log().close();
-    test_log().capturing = false;
-
-    llama_log_set(common_log_default_callback, nullptr);
+    });
 }
 
 std::string test_state_path(const std::string & model_name) {

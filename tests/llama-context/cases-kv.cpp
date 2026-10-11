@@ -10,6 +10,8 @@
 
 #include "common.h"
 
+#include "../../src/llama-ext.h" // llama_model_set_attn_rot
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -481,10 +483,10 @@ struct case_state_rotation : ctx_test {
     }
 
     case_result run(model_run & mr, testing & /*t*/) const override {
-        const std::string attn_rot_disable = common_get_env("LLAMA_ATTN_ROT_DISABLE");
-
         const auto make_context = [&](ggml_type type_k, ggml_type type_v, bool disable_rotation) {
-            common_set_env("LLAMA_ATTN_ROT_DISABLE", disable_rotation ? "1" : "0");
+            // a setting of the model, not of the process - a sweep that runs several models at a
+            //   time must not let this leak into the contexts of another model
+            llama_model_set_attn_rot(mr.model, !disable_rotation);
 
             ctx_opts opts;
             opts.n_ctx    = 32;
@@ -553,7 +555,8 @@ struct case_state_rotation : ctx_test {
                 TLOG_TRC("%s: state restored into rotation-disabled context, model does not use attention rotation\n", __func__);
             }
         }
-        common_set_env("LLAMA_ATTN_ROT_DISABLE", attn_rot_disable);
+
+        llama_model_set_attn_rot(mr.model, true); // the default, the cases that follow rely on it
 
         if (!success) {
             return case_result::fail();

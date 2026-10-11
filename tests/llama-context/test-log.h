@@ -20,9 +20,14 @@
 //   capture (every --models)    to a per-model file, dumped to stdout for each model that
 //                               failed once the table has been printed in full
 //
+// the capture is per thread: table mode runs the models on several threads and the llama, ggml
+// and backend callbacks fire on the thread that produced the message, so every worker captures
+// the log of its own model into its own file
+//
 // a model that aborts in the middle of a run dies before the dump, so the capture is flushed on
-// every error and between cases and an abort handler prints the tail of the open file - the
-// handler only uses open/lseek/read/write, the lock is deliberately not taken
+// every error and between cases and an abort handler prints the tail of every capture that is
+// open - the aborting thread is not necessarily the one that owns the interesting model. the
+// handler only uses open/lseek/read/write, no lock is taken
 //
 // llama, ggml and the backends are captured by replacing the callback installed by common_init
 // with llama_log_set (which forwards to ggml_log_set), so common/log is left untouched
@@ -55,11 +60,11 @@ struct test_logger {
     // GGML_LOG_LEVEL_NONE writes the text as is, used for streams such as the generated tokens
     void write(enum ggml_log_level level, const char * fmt, va_list args);
 
-    // print the tail of the capture, used when the process is going away
-    void dump_tail(size_t max_bytes);
+    // print the tail of a capture, used when the process is going away
+    static void dump_tail(const std::string & path, size_t max_bytes);
 };
 
-// the single logger of the run
+// the capture of the calling thread - one worker thread runs one model
 test_logger & test_log();
 
 int test_log_threshold();
@@ -73,12 +78,12 @@ void test_log_callback(enum ggml_log_level level, const char * text, void * user
 // returns true when the log was truncated and the file should be kept on disk
 bool test_log_dump(const std::string & path, size_t max_bytes);
 
-// a stream that funnels into the logger, to be handed to the testing harness
+// a stream that funnels into the capture of the calling thread, to be handed to the harness
 std::ostream & test_log_stream();
 
-// the capture and the abort handler are only needed when the logs go to a file
+// start capturing on the calling thread; installs the process-wide log callback and the abort
+// handler the first time it is called - only needed when the logs go to a file
 void test_log_capture_start(int verbosity);
-void test_log_capture_stop();
 
 // the cases share a working directory, so the session file is named after the model
 std::string test_state_path(const std::string & model_name);
