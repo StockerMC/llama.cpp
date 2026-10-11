@@ -150,7 +150,17 @@ endif ()
 
 # consolidated llama_context state tests: KV/recurrent state save, load, copy, rollback
 # built where the former test-recurrent-state-rollback was, it uses the same internal headers
-llama_build(test-llama-context.cpp)
+# the cases are grouped per file, the interface they implement is in llama-context/test-case.h
+set(LLAMA_CONTEXT_TEST_SRC
+    test-llama-context.cpp
+    llama-context/cases-kv.cpp
+    llama-context/cases-rs.cpp
+    llama-context/test-case.cpp
+    llama-context/test-log.cpp
+    llama-context/test-runner.cpp
+    llama-context/test-util.cpp
+)
+llama_build(${LLAMA_CONTEXT_TEST_SRC})
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
