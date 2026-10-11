@@ -148,9 +148,9 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
-# consolidated llama_context state tests: KV/recurrent state save, load, copy, rollback
-# built where the former test-recurrent-state-rollback was, it uses the same internal headers
-# the cases are grouped per file, the interface they implement is in llama-context/test-case.h
+# llama_context state tests: KV and recurrent state save, load, copy, rollback
+# the cases use internal headers, so they are built here; they are grouped per file and the
+# interface they implement is in llama-context/test-case.h
 set(LLAMA_CONTEXT_TEST_SRC
     test-llama-context.cpp
     llama-context/cases-kv.cpp
@@ -300,7 +300,7 @@ llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 
-# Run the consolidated context state tests against a real model
+# the context state cases against a real model, the sweep above uses the generated dummy ones
 llama_test(test-llama-context NAME test-llama-context-model LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-llama-context-model PROPERTIES FIXTURES_REQUIRED test-download-model)
 
