@@ -6,11 +6,22 @@
 
 const char * test_status_str(test_status status) {
     switch (status) {
-        case test_status::PASS: return "\033[1;32mPASS\033[0m";
+        case test_status::PASS: return "\033[1;32mOK\033[0m";
         case test_status::FAIL: return "\033[1;31mFAIL\033[0m";
         case test_status::SKIP: return "\033[1;33mSKIP\033[0m";
     }
     return "";
+}
+
+// the printable width of a verdict, the color escapes of test_status_str are not part of it
+size_t test_status_width(test_status status) {
+    switch (status) {
+        case test_status::PASS: return 2; // "OK"
+        case test_status::FAIL: return 4; // "FAIL"
+        case test_status::SKIP: return 4; // "SKIP"
+    }
+
+    return 0;
 }
 
 test_status merge_status(test_status a, test_status b) {

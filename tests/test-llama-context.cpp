@@ -387,7 +387,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    auto col_width = [](const char * name) { return (int) std::max(strlen(name), (size_t) 4); };
+    // a column is as wide as its case name, but never narrower than the widest verdict
+    const size_t verdict_width = std::max({ test_status_width(test_status::PASS),
+                                            test_status_width(test_status::FAIL),
+                                            test_status_width(test_status::SKIP) });
+
+    auto col_width = [&](const char * name) { return (int) std::max(strlen(name), verdict_width); };
 
     size_t name_width = 5; // "Model"
     for (const auto & model_path : models) {
@@ -434,7 +439,9 @@ int main(int argc, char ** argv) {
             LOG("%-*s", (int) name_width, res.name.c_str());
 
             for (size_t i = 0; i < res.runs.size(); i++) {
-                LOG("  %s%*s", test_status_str(res.runs[i].status), col_width(cases[i]->name()) - 4, "");
+                const int pad = (int) (col_width(cases[i]->name()) - test_status_width(res.runs[i].status));
+
+                LOG("  %s%*s", test_status_str(res.runs[i].status), pad, "");
 
                 switch (res.runs[i].status) {
                     case test_status::PASS: n_pass[i]++; break;

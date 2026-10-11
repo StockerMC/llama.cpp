@@ -35,7 +35,11 @@ enum class test_status {
     SKIP,
 };
 
+// the verdict as printed in the result table, colored
 const char * test_status_str(test_status status);
+
+// how many columns the verdict takes in the table - the escapes of the color are not printed
+size_t test_status_width(test_status status);
 
 // a skipped case does not fail the run, a failed case always does
 test_status merge_status(test_status a, test_status b);
