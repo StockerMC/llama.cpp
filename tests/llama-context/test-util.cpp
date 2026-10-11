@@ -2,8 +2,7 @@
 
 #include "test-log.h"
 
-#include "../../src/llama-io.h"
-#include "../../src/llama-memory.h"
+#include "../../src/llama-ext.h" // llama_memory_get_buffers
 
 #include "common.h"
 
@@ -288,27 +287,8 @@ bool corrupt_state(std::vector<uint8_t> & data) {
 // context
 //
 
-// collects the cache buffers touched by a state write, so that they can be filled with a
-// known pattern before a restore - a restore that reads cells it never wrote then produces
-// garbage instead of silently passing
-struct cache_buffer_collector : llama_io_write_i {
-    std::set<ggml_backend_buffer_t> buffers;
-    size_t size = 0;
-
-    void write(const void *, size_t n) override {
-        size += n;
-    }
-
-    void write_tensor(ggml_tensor * tensor, size_t, size_t n) override {
-        buffers.insert(tensor->buffer);
-        size += n;
-    }
-
-    size_t n_bytes() override {
-        return size;
-    }
-};
-
+// fill the buffers of the cache before a restore - a restore that reads cells it never wrote
+// then produces garbage instead of silently passing
 llama_context_ptr init_ctx(llama_model * model, llama_context_params cparams, uint8_t fill) {
     llama_context_ptr ctx{llama_init_from_model(model, cparams)};
     if (!ctx || fill == 0) {
@@ -321,14 +301,14 @@ llama_context_ptr init_ctx(llama_model * model, llama_context_params cparams, ui
         return nullptr;
     }
     llama_synchronize(ctx.get());
-    cache_buffer_collector collector;
-    llama_get_memory(ctx.get())->state_write(collector);
+
+    const auto buffers = llama_memory_get_buffers(llama_get_memory(ctx.get()));
     llama_memory_clear(llama_get_memory(ctx.get()), true);
-    if (collector.buffers.empty()) {
+    if (buffers.empty()) {
         TLOG_ERR("%s: no cache buffers found\n", __func__);
         return nullptr;
     }
-    for (auto * buffer : collector.buffers) {
+    for (auto * buffer : buffers) {
         ggml_backend_buffer_clear(buffer, fill);
     }
     return ctx;
