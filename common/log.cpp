@@ -165,6 +165,7 @@ struct common_log {
         colors     = false;
         prefix     = false;
         timestamps = false;
+        file_only  = false;
         running    = false;
         t_start    = t_us();
 
@@ -193,6 +194,7 @@ private:
     bool colors;
     bool prefix;
     bool timestamps;
+    bool file_only; // write the file and print nothing
     bool running;
 
     int64_t t_start;
@@ -205,7 +207,9 @@ private:
     bool print_entry(const common_log_entry & e) const {
         if (e.is_end) return true;
 
-        e.print();
+        if (!file_only) {
+            e.print();
+        }
         if (file) {
             e.print(file);
         }
@@ -384,7 +388,7 @@ public:
         thrd.join();
     }
 
-    void set_file(const char * path) {
+    void set_file(const char * path, bool file_only_ = false) {
         pause();
 
         if (file) {
@@ -396,6 +400,9 @@ public:
         } else {
             file = nullptr;
         }
+
+        // without a file there is nothing to write to, the console keeps printing
+        file_only = path && file_only_;
 
         resume();
     }
@@ -493,8 +500,8 @@ void common_log_add_json(struct common_log * log, const char * type, const commo
     log->add_json(type, obj);
 }
 
-void common_log_set_file(struct common_log * log, const char * file) {
-    log->set_file(file);
+void common_log_set_file(struct common_log * log, const char * file, bool file_only) {
+    log->set_file(file, file_only);
 }
 
 void common_log_set_colors(struct common_log * log, log_colors colors) {

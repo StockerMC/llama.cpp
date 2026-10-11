@@ -42,6 +42,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <mutex>
 #include <random>
@@ -122,8 +123,8 @@ static model_result run_model(const std::string & model_path,
 
     if (capture_log) {
         // capture the model from the moment it is loaded, so that even a load failure has a log
-        test_log_capture_start(params.verbosity);
-        test_log().open(res.log_path);
+        test_log_set_threshold(params.verbosity);
+        test_log_capture(res.log_path);
     }
 
     struct common_params model_params = params;
@@ -158,7 +159,7 @@ static model_result run_model(const std::string & model_path,
     }
 
     if (capture_log) {
-        test_log().close();
+        test_log_capture("");
     }
 
     std::remove(test_state_path(res.name).c_str()); // the cases leave the session file behind
@@ -330,7 +331,7 @@ int main(int argc, char ** argv) {
     }
 
     // -lv applies to the test's own logging too
-    test_log().set_threshold(params.verbosity);
+    test_log_set_threshold(params.verbosity);
 
     // one model per thread: fitting the params to the free memory would swap in a log callback
     //   that points to the stack of the thread doing the fit, which is only safe while no other
@@ -354,22 +355,23 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (!models_dir.empty() || !logs_dir.empty()) {
-        test_log_capture_start(params.verbosity);
-    }
+    // route the log of every thread to its own capture - without a capture of its own, a thread
+    //   writes to the console as usual
+    test_log_init();
 
     llama_backend_init();
 
     // run the full suite for a single model
     if (models_dir.empty()) {
-        // the harness reports the cases through the test logger, so that its verdicts end up in
-        //   the per-model capture with --logs and on stderr otherwise
-        testing t(test_log_stream());
+        // single model mode reports the cases as they go, on stderr
+        testing t(std::cerr);
 
         const model_result res = run_model(params.model.path, params, cases, logs_dir, t, !logs_dir.empty());
 
         if (!res.failed) {
-            LOG("All applicable tests passed.\n");
+            // stderr, not the logger: the harness writes to it synchronously, this line has to
+            //   arrive after its summary
+            fprintf(stderr, "All applicable tests passed.\n");
         }
 
         // a model that failed to load never reached the harness, its verdicts are only in the
@@ -483,8 +485,9 @@ int main(int argc, char ** argv) {
     std::atomic<size_t> next_model(0);
 
     auto worker = [&]() {
-        // one harness per thread - its verdict lines go into the capture of the model being run
-        testing t(test_log_stream());
+        // one harness per thread, printing to nowhere - the table carries the verdicts, the
+        //   reasons are logged to the file of the model
+        testing t(test_null_stream());
 
         for (size_t i = next_model.fetch_add(1); i < results.size(); i = next_model.fetch_add(1)) {
             results[i] = run_model(models[i], params, cases, logs_dir, t, true);

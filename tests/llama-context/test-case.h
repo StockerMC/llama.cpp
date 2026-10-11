@@ -1,5 +1,6 @@
 #pragma once
 
+#include "test-log.h"
 #include "test-util.h"
 
 #include "../testing.h"
@@ -84,10 +85,14 @@ struct ctx_test {
 };
 
 // record an expectation that did not hold and give up on the case - the harness counts the
-// failure and prints it, the message ends up in the log of the current model
+// failure and prints it in single model mode, in table mode its output is discarded, so the
+// reason is logged here as well
 #define CTX_REQUIRE(t, cond, msg) \
     do { \
         if (!(t).assert_true((msg), (cond))) { \
+            if (test_log_capturing()) { \
+                TLOG_ERR("%s\n", std::string(msg).c_str()); \
+            } \
             return case_result::fail(); \
         } \
     } while (0)

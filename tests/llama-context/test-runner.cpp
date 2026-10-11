@@ -47,54 +47,77 @@ std::vector<case_run> run_cases(model_run & mr, testing & t, const std::vector<c
         t.test(tc->name(), [&](testing & tt) {
             const int failures_before = tt.failures;
 
-            if (const std::string why = tc->skip_reason(mr); !why.empty()) {
-                run.status = test_status::SKIP;
-                run.reason = why;
-            } else if (tc->needs_baseline() && !mr.have_baseline) {
-                run.status = test_status::SKIP;
-                run.reason = "no baseline";
-            } else if (!tc->uses_fill()) {
-                mr.fill = 0;
-
-                const case_result res = tc->run(mr, tt);
-
-                run.status = res.status;
-                run.reason = res.reason;
-            } else {
-                // the recurrent cases are also run against a cache pre-filled with a known
-                // pattern, so that a restore reading cells it never wrote cannot pass
-                run.detail = "fill 0, 0x3e";
-
-                for (const uint8_t fill : { 0, 0x3e }) {
-                    TLOGV(LOG_LEVEL_INFO, "(fill 0x%02x)\n", fill);
-
-                    mr.fill = fill;
+            // the harness prints the exception it catches - in table mode that goes nowhere, so
+            // log it here and let the harness count the failure
+            try {
+                if (const std::string why = tc->skip_reason(mr); !why.empty()) {
+                    run.status = test_status::SKIP;
+                    run.reason = why;
+                } else if (tc->needs_baseline() && !mr.have_baseline) {
+                    run.status = test_status::SKIP;
+                    run.reason = "no baseline";
+                } else if (!tc->uses_fill()) {
+                    mr.fill = 0;
 
                     const case_result res = tc->run(mr, tt);
 
-                    run.status = merge_status(run.status, res.status);
-                    if (res.status == test_status::SKIP && run.reason.empty()) {
-                        run.reason = res.reason;
-                    }
-                    if (res.status == test_status::FAIL) {
-                        break;
+                    run.status = res.status;
+                    run.reason = res.reason;
+                } else {
+                    // the recurrent cases are also run against a cache pre-filled with a known
+                    // pattern, so that a restore reading cells it never wrote cannot pass
+                    run.detail = "fill 0, 0x3e";
+
+                    for (const uint8_t fill : { 0, 0x3e }) {
+                        TLOGV(LOG_LEVEL_INFO, "(fill 0x%02x)\n", fill);
+
+                        mr.fill = fill;
+
+                        const case_result res = tc->run(mr, tt);
+
+                        run.status = merge_status(run.status, res.status);
+                        if (res.status == test_status::SKIP && run.reason.empty()) {
+                            run.reason = res.reason;
+                        }
+                        if (res.status == test_status::FAIL) {
+                            break;
+                        }
                     }
                 }
+            } catch (...) {
+                if (test_log_capturing()) {
+                    TLOG_ERR("%s: unhandled exception\n", run.name.c_str());
+                }
+
+                if (unified_state) {
+                    mr.params.kv_unified = unified_base;
+                }
+
+                throw;
             }
 
             // hand the verdict to the harness: a failure must be counted by it, a skip must
             // carry its reason - a body that asserted on its own is already counted
+            const std::string what = tc->name();
+
             if (run.status == test_status::FAIL && tt.failures == failures_before) {
-                tt.assert_true(std::string(tc->name()) + " failed, see the log", false);
+                // the body gave up without asserting, the log is all there is to say why
+                if (test_log_capturing()) {
+                    TLOG_ERR("%s failed%s%s\n", what.c_str(),
+                            run.reason.empty() ? "" : ": ", run.reason.c_str());
+                }
+
+                tt.assert_true(what + " failed, see the log", false);
             } else if (run.status == test_status::SKIP) {
+                if (test_log_capturing() && !run.reason.empty()) {
+                    TLOG_INF("%s skipped: %s\n", what.c_str(), run.reason.c_str());
+                }
+
                 tt.skip(run.reason);
             }
         });
 
         runs.push_back(std::move(run));
-
-        // keep the captured log usable even if the next case crashes the process
-        test_log().flush();
     }
 
     return runs;

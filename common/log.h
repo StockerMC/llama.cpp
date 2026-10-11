@@ -91,7 +91,9 @@ void common_log_add(struct common_log * log, enum ggml_log_level level, const ch
 // O - output  (stdout, V = LOG_DEFAULT_OUTPUT)
 //
 
-void common_log_set_file      (struct common_log * log, const char * file); // not thread-safe
+// with file_only the messages are written to the file and nothing goes to the console - for
+// tools and tests that keep a log per run and print it only when the run failed
+void common_log_set_file      (struct common_log * log, const char * file, bool file_only = false); // not thread-safe
 void common_log_set_colors    (struct common_log * log, log_colors colors); // not thread-safe
 bool common_log_get_colors    (struct common_log * log);                    // whether colors are enabled
 void common_log_set_prefix    (struct common_log * log, bool prefix);       // whether to output prefix to each log

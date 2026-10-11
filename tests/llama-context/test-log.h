@@ -2,88 +2,60 @@
 
 #include "log.h"
 
-#include <cstdarg>
 #include <cstddef>
-#include <fstream>
-#include <mutex>
 #include <ostream>
-#include <streambuf>
 #include <string>
 
 // test logging
 //
-// table mode silences the common logger to keep the result table readable, which drops every
-// message the cases log with the common macros - a failing case would then print nothing but
-// FAIL. the cases log here instead:
+// table mode runs one model per thread and prints a result table, so the log of a model goes to
+// a file of its own, and the log of a model that failed is printed to stdout once the table has
+// been printed in full. single model mode has a file only with --logs, its messages go to
+// stderr as usual
 //
-//   no capture (single model)   to stderr, gated by -lv
-//   capture (every --models)    to a per-model file, dumped to stdout for each model that
-//                               failed once the table has been printed in full
+// the log callbacks of llama, ggml and the backends are process wide, so the test installs one
+// callback that hands every message to the capture of the calling thread - one worker, one
+// model, one file. the capture is a common_log that writes only to its file
 //
-// the capture is per thread: table mode runs the models on several threads and the llama, ggml
-// and backend callbacks fire on the thread that produced the message, so every worker captures
-// the log of its own model into its own file
-//
-// a model that aborts in the middle of a run dies before the dump, so the capture is flushed on
-// every error and between cases and an abort handler prints the tail of every capture that is
-// open - the aborting thread is not necessarily the one that owns the interesting model. the
-// handler only uses open/lseek/read/write, no lock is taken
-//
-// llama, ggml and the backends are captured by replacing the callback installed by common_init
-// with llama_log_set (which forwards to ggml_log_set), so common/log is left untouched
-//
-// the testing harness (tests/testing.h) writes to a std::ostream - test_log_stream() returns a
-// stream that funnels into this logger, so that its [PASS] / [SKIP] / ASSERTION FAILED lines
-// end up in the same place as the TLOG_* output
+// the harness (tests/testing.h) writes to a std::ostream: stderr in single model mode, a
+// discard stream in table mode - the table itself carries the verdicts there, and a case that
+// did not pass logs why with the macros below, so the file of the model still explains the
+// verdict
 //
 
-// how much of a captured log to print when a model fails, and how much of it to print when the
-// process aborts
+// how much of a model log to print when the model fails
 extern const size_t LOG_DUMP_MAX_BYTES;
 
-struct test_logger {
-    std::mutex    mtx;
-    std::ofstream file;
-    std::string   path;      // the file an abort dumps the tail of
-    std::string   pending;   // logged before the first model opened a file
-    bool          capturing = false;
-    int           thold = LOG_LEVEL_INFO;
+// replace the log callback of common_init with the one that routes a message to the capture of
+// the thread that produced it - call once, before any model is loaded
+void test_log_init();
 
-    void set_threshold(int thold_);
+// routes the log of the calling thread to the given file; an empty path ends the capture and
+// returns the messages to stderr - the file holds everything the run logged, up to the
+// verbosity of the process
+void test_log_capture(const std::string & path);
 
-    void open(const std::string & path_);
-    void close();
+// true while the log of this thread goes to a file
+bool test_log_capturing();
 
-    // between cases, so that an abort keeps a usable file behind
-    void flush();
-
-    // GGML_LOG_LEVEL_NONE writes the text as is, used for streams such as the generated tokens
-    void write(enum ggml_log_level level, const char * fmt, va_list args);
-
-    // print the tail of a capture, used when the process is going away
-    static void dump_tail(const std::string & path, size_t max_bytes);
-};
-
-// the capture of the calling thread - one worker thread runs one model
-test_logger & test_log();
-
+// the verbosity the TLOG_* macros compare against
 int test_log_threshold();
 
-void test_log_add(enum ggml_log_level level, const char * fmt, ...);
+void test_log_set_threshold(int verbosity);
 
-// captures the logs of llama, ggml and the backends
+// write to the capture of this thread, or to stderr when there is none
+void test_log_add(enum ggml_log_level level, const char * fmt, ...) LOG_ATTRIBUTE_FORMAT(2, 3);
+
+// captures the logs of llama, ggml and the backends, install it with llama_log_set
 void test_log_callback(enum ggml_log_level level, const char * text, void * user_data);
+
+// in table mode the table itself carries the verdicts, the harness writes here - in single model
+// mode the harness writes to stderr
+std::ostream & test_null_stream();
 
 // print a captured log to stdout, keeping its tail when it is too long
 // returns true when the log was truncated and the file should be kept on disk
 bool test_log_dump(const std::string & path, size_t max_bytes);
-
-// a stream that funnels into the capture of the calling thread, to be handed to the harness
-std::ostream & test_log_stream();
-
-// start capturing on the calling thread; installs the process-wide log callback and the abort
-// handler the first time it is called - only needed when the logs go to a file
-void test_log_capture_start(int verbosity);
 
 // the cases share a working directory, so the session file is named after the model
 std::string test_state_path(const std::string & model_name);
