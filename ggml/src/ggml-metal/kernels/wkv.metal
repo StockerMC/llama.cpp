@@ -177,3 +177,85 @@ kernel void kernel_rwkv_wkv7_f32(
             + tid * head_size + i] = state[i];
     }
 }
+
+template<uint HS>
+kernel void kernel_gated_linear_attn_f32(
+    device const float * k,
+    device const float * v,
+    device const float * q,
+    device const float * g,
+    device const float * state_in,
+    device       float * dst,
+    constant    uint & B,
+    constant    uint & T,
+    constant    uint & C,
+    constant    uint & H,
+    constant   float & scale,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]])  {
+
+    const uint head_size = HS;
+    const uint batch_id = tgpig.x / H;
+    const uint head_id = tgpig.x % H;
+    const uint tid = tpitg.x;
+
+    if (batch_id >= B || head_id >= H) {
+        return;
+    }
+
+    const uint state_size = C * head_size;
+    const uint n_seq_tokens = T / B;
+
+    threadgroup float _k[head_size];
+    threadgroup float _q[head_size];
+    threadgroup float _g[head_size];
+
+    float state[head_size];
+
+    for (uint i = 0; i < head_size; i++) {
+        state[i] = state_in[batch_id * state_size + head_id * head_size * head_size
+                          + i * head_size + tid];
+    }
+
+    const uint start_t = batch_id * n_seq_tokens * C + head_id * head_size + tid;
+    const uint end_t = (batch_id + 1) * n_seq_tokens * C + head_id * head_size + tid;
+
+    for (uint t = start_t; t < end_t; t += C) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        _k[tid] = k[t];
+        _q[tid] = q[t];
+        _g[tid] = g[t];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float v_val = v[t];
+        float y = 0.0;
+
+        for (uint j = 0; j < head_size; j += 4) {
+            float4 k_vec = float4(_k[j], _k[j+1], _k[j+2], _k[j+3]);
+            float4 q_vec = float4(_q[j], _q[j+1], _q[j+2], _q[j+3]);
+            float4 g_vec = float4(_g[j], _g[j+1], _g[j+2], _g[j+3]);
+            float4 s_vec = float4(state[j], state[j+1], state[j+2], state[j+3]);
+
+            s_vec = s_vec * g_vec + k_vec * v_val;
+            y += dot(q_vec, s_vec);
+
+            state[j]   = s_vec[0];
+            state[j+1] = s_vec[1];
+            state[j+2] = s_vec[2];
+            state[j+3] = s_vec[3];
+        }
+
+        dst[t] = y * scale;
+    }
+
+    for (uint i = 0; i < head_size; i++) {
+        dst[T * C + batch_id * state_size + head_id * head_size * head_size
+            + i * head_size + tid] = state[i];
+    }
+}
+
+typedef decltype(kernel_gated_linear_attn_f32<64>) kernel_gated_linear_attn_t;
+
+template [[host_name("kernel_gated_linear_attn_f32_64")]]  kernel kernel_gated_linear_attn_t kernel_gated_linear_attn_f32<64>;
+template [[host_name("kernel_gated_linear_attn_f32_128")]] kernel kernel_gated_linear_attn_t kernel_gated_linear_attn_f32<128>;
